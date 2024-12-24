@@ -1,0 +1,28 @@
+# Use the official Python image as a parent image
+FROM python:3.12
+
+# Install Git
+RUN apt-get update && apt-get install -y git
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt .
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code into the container
+COPY ./code ./
+
+# Fails if there's no .env
+COPY ./code/.env .env
+
+# Expose port 80 for FastAPI to listen on
+EXPOSE 8000
+
+# Run migrations and start the server
+CMD alembic upgrade heads && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+# CMD uvicorn main:app --host 0.0.0.0 --port 8000 --reload

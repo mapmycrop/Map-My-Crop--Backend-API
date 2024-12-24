@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MMC API hub hosts all API in MMC domain. This template deploys the APIs in an ECS cluster with a load balancer in front.
+
+Parameters:
+  # This comes from the pipeline and must be declared
+  Env:
+    Type: String
+    Description: Whether we are deploying it as dev, preprod or prod
+    AllowedValues:
+      - dev
+      - preprod
+      - prod
+
+Mappings:
+  Vars:
+    dev:
+      VpcId: vpc-063563bd8647c1d54
+      SubnetIds:
+        - subnet-048bc4366fe6e8523
+        - subnet-038148599e201032c
+        - subnet-00d5d0a0646f19b13
+      ECRRepositoryName: mmc-dev-api
+      ACMCertificateId: c6995877-5bb0-45de-93c5-982c7a2b9e7d
+      SERVER: https://api.mapmycrop.store
+      TASKCOUNT: 2
+    preprod:
+      VpcId: vpc-063563bd8647c1d54
+      SubnetIds:
+        - subnet-048bc4366fe6e8523
+        - subnet-038148599e201032c
+        - subnet-00d5d0a0646f19b13
+      ECRRepositoryName: mmc-preprod-api
+      ACMCertificateId: 6ce40924-8a67-4d17-9def-cf6ef27fa0ae
+      SERVER: https://api.mapmycrop.live
+      TASKCOUNT: 1  
+    prod:
+      VpcId: vpc-0d06c88482625b342
+      SubnetIds:
+        - subnet-002f453552cd16184
+        - subnet-0272deeb8967eb7b8
+        - subnet-0b772284e40f7c6f1
+      ECRRepositoryName: mmc-prod-api
+      ACMCertificateId: d0a96417-aca8-4e0b-b52c-fed2de3141e6
+      SERVER: https://api.mapmycrop.com
+      TASKCOUNT: 4
+
+Conditions:
+  isProd: !Equals [!Ref Env, prod]
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-${Env}-cluster"
+      CapacityProviders:
+        - FARGATE
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: "*"
+          PolicyName: ECSFullLogsAccess
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # TODO: Add protection policy
+      # DataProtectionPolicy
+      LogGroupName: !Sub "${AWS::StackName}-${Env}-logs"
+      RetentionInDays: 30
+
+  ECSTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Image: !Sub
+            - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepositoryName}:IMAGE_TAG
+            - ECRRepositoryName: !FindInMap [Vars, !Ref Env, ECRRepositoryName]
+          Name: !Sub "${AWS::StackName}-${Env}-task"
+          PortMappings:
+            - ContainerPort: 8000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-stream-prefix: task
+          Environment:
+            - Name: REDIS_HOST
+              Value: !GetAtt ElasticacheResource.RedisEndpoint.Address
+            - Name: SERVER
+              Value: !FindInMap [Vars, !Ref Env, SERVER]
+      Cpu: !If [isProd, 1024, 512]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      Memory: !If [isProd, 4GB, 1GB]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+
+  # TODO: Separate Security Group for load Balancer
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-${Env}-service-sg"
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow everything
+          IpProtocol: -1
+
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          # TODO: Update this rule
+          Description: Allow HTTP
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          Description: Allow HTTP
+          FromPort: 8000
+          IpProtocol: tcp
+          ToPort: 8000
+        - CidrIp: 0.0.0.0/0
+          Description: Allow HTTP
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !FindInMap [Vars, !Ref Env, VpcId]
+
+  ECSLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-${Env}-alb"
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ECSServiceSecurityGroup
+      Subnets: !FindInMap [Vars, !Ref Env, SubnetIds]
+      Type: application
+
+  ECSLoadBalancerTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /status/db
+      HealthCheckPort: 8000
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 10
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !FindInMap [Vars, !Ref Env, VpcId]
+
+  ECSLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    # TODO: Add Deletion protection
+    Properties:
+      Certificates:
+        - CertificateArn: !Sub
+            - arn:${AWS::Partition}:acm:${AWS::Region}:${AWS::AccountId}:certificate/${ACMCertificateId}
+            - ACMCertificateId: !FindInMap [Vars, !Ref Env, ACMCertificateId]
+      DefaultActions:
+        - TargetGroupArn: !GetAtt ECSLoadBalancerTarget.TargetGroupArn
+          Type: forward
+      LoadBalancerArn: !Ref ECSLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-0-2021-06
+
+  ECSHTTPRedirectListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+      LoadBalancerArn: !Ref ECSLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ECSLoadBalancerListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      DeploymentController:
+        Type: ECS
+      DesiredCount: !FindInMap [Vars, !Ref Env, TASKCOUNT]
+      HealthCheckGracePeriodSeconds: 100
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: !Sub "${AWS::StackName}-${Env}-task"
+          ContainerPort: 8000
+          TargetGroupArn: !GetAtt ECSLoadBalancerTarget.TargetGroupArn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSServiceSecurityGroup
+          Subnets: !FindInMap [Vars, !Ref Env, SubnetIds]
+      PlatformVersion: LATEST
+      SchedulingStrategy: REPLICA
+      ServiceConnectConfiguration:
+        Enabled: False
+      ServiceName: !Sub "${AWS::StackName}-${Env}-service"
+      TaskDefinition: !Ref ECSTask
+
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for the elasticache
+      SubnetIds: !FindInMap [Vars, !Ref Env, SubnetIds]
+
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-${Env}-elasticache-sg"
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow everything
+          IpProtocol: -1
+      SecurityGroupIngress:
+        - Description: Allow HTTP
+          FromPort: 6379
+          IpProtocol: -1
+          SourceSecurityGroupId: !Ref ECSServiceSecurityGroup
+          ToPort: 6379
+      VpcId: !FindInMap [Vars, !Ref Env, VpcId]
+
+  ElasticacheResource:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      AutoMinorVersionUpgrade: False
+      AZMode: single-az
+      CacheNodeType: cache.t4g.micro
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      Engine: redis
+      NumCacheNodes: 1
+      Port: 6379
+      VpcSecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroup
+
+Outputs:
+  ClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+
+  ElastiCacheEndpoint:
+    Description: Endpoint for the elasticache
+    Value: !GetAtt ElasticacheResource.RedisEndpoint.Address

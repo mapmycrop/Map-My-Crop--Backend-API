@@ -1,0 +1,36 @@
+version: "3"
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev # Use the development Dockerfile
+    environment:
+      db_host: db
+      db_port: 5432
+      db_name: mmc_dev
+      db_pwd: postgres
+      db_usr: postgres
+      REDIS_HOST: cache
+      REDIS_PORT: 6379
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the current directory into the container, will reload the code as it's changed
+      - ./code:/app
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: postgis/postgis:14-3.4
+    environment:
+      POSTGRES_DB: mmc_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Mount an initialization SQL script
+
+  cache:
+    image: redis:7.2.1
+    ports:
+      - "6379:6379"

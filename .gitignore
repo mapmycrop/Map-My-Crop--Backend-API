@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+dist/
+
+# Environments
+env/
+.env*
+.venv
+
+# mypy
+.mypy_cache/
+
+# empty folder but needed
+code/static/*
+!.gitkeep
+
+# editor 
+.vscode

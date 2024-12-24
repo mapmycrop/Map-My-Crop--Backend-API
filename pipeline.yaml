@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MMC API CI/CD pipeline. Actions are source, build and deploy. Get the code, build the docker file, push to ecr, update the template and deploy the template.
+
+Parameters:
+  Env:
+    Type: String
+    Description: Whether we are deploying it as dev, preprod or prod
+    AllowedValues:
+      - dev
+      - preprod
+      - prod
+
+Mappings:
+  Vars:
+    dev:
+      CodestarConnectionId: 72adc830-dc44-4166-9faa-99b58001a463
+      Stack: mmc-dev-api
+      EcrImageId: mmc-dev-api
+      SecretsManagerId: mmc-dev-api
+      BranchName: dev
+    preprod:
+      CodestarConnectionId: 32e4a1a0-13e4-4c37-9bc2-b51a5f4634fc
+      Stack: mmc-preprod-api
+      EcrImageId: mmc-preprod-api
+      SecretsManagerId: mmc-preprod-api
+      BranchName: preprod
+    prod:
+      CodestarConnectionId: 5f5fddfe-1064-4534-9c12-d6ee6356ef61
+      Stack: mmc-prod-api
+      EcrImageId: mmc-prod-api
+      SecretsManagerId: mmc-prod-api
+      BranchName: main
+
+Conditions:
+  isProd: !Equals [!Ref Env, prod]
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 15
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        RestrictPublicBuckets: true
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: !Sub "${ArtifactsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Sub
+                  - arn:${AWS::Partition}:codestar-connections:${AWS::Region}:${AWS::AccountId}:connection/${CodestarConnectionId}
+                  - CodestarConnectionId:
+                      !FindInMap [Vars, !Ref Env, CodestarConnectionId]
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuildBatches
+                  - codebuild:StartBuildBatch
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: !Sub
+                  - arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Stack}*
+                  - Stack: !FindInMap [Vars, !Ref Env, Stack]
+          PolicyName: !Sub "${AWS::StackName}-${AWS::Region}-CodepipelineRole"
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !Sub "${ArtifactsBucket.Arn}*"
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: !GetAtt CodeBuildLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub
+                  - arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrImageId}
+                  - EcrImageId: !FindInMap [Vars, !Ref Env, EcrImageId]
+              - Effect: Allow
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:ListSecrets
+                Resource: !Sub
+                  - arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretsManagerId}*
+                  - SecretsManagerId:
+                      !FindInMap [Vars, !Ref Env, SecretsManagerId]
+          PolicyName: !Sub "${AWS::StackName}-${AWS::Region}-CodebuidRole"
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${AWS::StackName}-${AWS::Region}-codebuild-logs"
+      RetentionInDays: 30
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      # TODO: Do later
+      # BadgeEnabled: Boolean
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+      ConcurrentBuildLimit: 1
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ECR_IMAGE_ID
+            Value: !FindInMap [Vars, !Ref Env, EcrImageId]
+          - Name: SECRETS_MANAGER_ID
+            Value: !FindInMap [Vars, !Ref Env, SecretsManagerId]
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Sub "${AWS::StackName}-${AWS::Region}-codebuild-logs"
+          Status: ENABLED
+          StreamName: !Sub "${AWS::StackName}-${AWS::Region}-codebuild"
+      QueuedTimeoutInMinutes: 30
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        BuildSpec: buildspec.yaml
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 60
+      Visibility: PRIVATE
+
+  CloudformationActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt CodePipelineRole.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !Sub "${ArtifactsBucket.Arn}*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: !Sub
+                  - arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Stack}*
+                  - Stack: !FindInMap [Vars, !Ref Env, Stack]
+              - Effect: Allow
+                Action:
+                  - iam:*
+                Resource: "*"
+          PolicyName: !Sub "${AWS::StackName}-${AWS::Region}-CloudformatonActionRole"
+
+  CloudformationCreateChangeSetActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                Resource: "*"
+              # Flexible permissions to create services
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                  - logs:*
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - iam:*
+                  - elasticache:*
+                Resource: "*"
+          PolicyName: !Sub "${AWS::StackName}-${AWS::Region}-CloudformatonActionRole"
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref ArtifactsBucket
+        Type: S3
+      Name: !Sub ${AWS::StackName}-${AWS::Region}-codepipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Actions:
+            - ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: 1
+              Configuration:
+                ConnectionArn: !Sub
+                  - arn:${AWS::Partition}:codestar-connections:${AWS::Region}:${AWS::AccountId}:connection/${CodestarConnectionId}
+                  - CodestarConnectionId:
+                      !FindInMap [Vars, !Ref Env, CodestarConnectionId]
+                FullRepositoryId: "Map-My-Crop/apihub"
+                BranchName: !FindInMap [Vars, !Ref Env, BranchName]
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              Name: Source
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+          Name: Source
+        - Actions:
+            - ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                PrimarySource: SourceArtifact
+              InputArtifacts:
+                - Name: SourceArtifact
+              Name: Build
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 2
+          Name: Build
+        - Actions:
+            - ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !FindInMap [Vars, !Ref Env, Stack]
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_IAM
+                ChangeSetName: default
+                RoleArn: !GetAtt CloudformationCreateChangeSetActionRole.Arn
+                TemplatePath: BuildArtifact::build_template.yaml
+                OutputFileName: StackChangeSetOutput.json
+                ParameterOverrides: !Sub '{"Env": "${Env}"}'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Name: CreateChangeSet
+              OutputArtifacts:
+                - Name: DeployArtifactChangeSet
+              RunOrder: 3
+              RoleArn: !GetAtt CloudformationActionRole.Arn
+            - ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                CustomData: The latest changes.
+              Name: ManualApproval
+              RunOrder: 4
+            - ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !FindInMap [Vars, !Ref Env, Stack]
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_IAM
+                ChangeSetName: default
+                OutputFileName: StackUpdateOutput.json
+                ParameterOverrides: !Sub '{"Env": "${Env}"}'
+              InputArtifacts:
+                - Name: DeployArtifactChangeSet
+              Name: ExecuteChangeSet
+              RunOrder: 5
+          Name: Deploy

@@ -1,0 +1,43 @@
+# source: https://docs.aws.amazon.com/codebuild/latest/userguide/sample-docker.html
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo Entered the install phase...
+      - echo Check variables
+      - echo account id - $AWS_ACCOUNT_ID
+      - echo ecr image id - $ECR_IMAGE_ID
+      - echo secrets manager id - $SECRETS_MANAGER_ID
+      # Get the first 6 characters of commit id
+      - IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-6)
+      - echo ecr image tag - $IMAGE_TAG
+  pre_build:
+    commands:
+      - echo Logging into docker hub for pulling public images
+      - echo dckr_pat_bS-KrsuTqHxbMj8DsMX1EJjj-v8 | docker login -u mapmycrop --password-stdin
+  build:
+    commands:
+      - echo Entered the build phase...
+      - echo Build started on `date`
+      # See the code
+      - ls -la 
+      - echo "Get secrets"
+      # get secrets from secrets manager
+      - aws secretsmanager get-secret-value --secret-id arn:aws:secretsmanager:${AWS_DEFAULT_REGION}:${AWS_ACCOUNT_ID}:secret:$SECRETS_MANAGER_ID | jq -r '.SecretString' | jq -r 'to_entries|map("\(.key)= '\''\(.value|tostring)'\''")|.[]' > code/.env
+      - echo Building the Docker image...          
+      - docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_IMAGE_ID:$IMAGE_TAG -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_IMAGE_ID:latest .
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      
+  post_build:
+      commands:
+        - echo Build completed on `date`
+        - echo Pushing the Docker image...
+        - docker push --all-tags $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_IMAGE_ID
+        # Update the template with the latest image tag
+        - sed "s/\IMAGE_TAG/$IMAGE_TAG/g" template.yaml > build_template.yaml
+        # TODO: Keep the last 5 images and delete only images older than 2 weeks. write a bash script for this
+artifacts:
+  # Cloudformation step only needs a single file in the next step
+  files: build_template.yaml 
